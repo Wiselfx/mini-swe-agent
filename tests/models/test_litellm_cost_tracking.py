@@ -55,3 +55,70 @@ def test_pricing_override_beats_registry():
 
 def test_free_model_reports_zero_cost_without_raising():
     assert make_model("opencode_go/beam-free")._calculate_cost(make_response(500, 50, 100))["cost"] == 0.0
+
+
+# --- Thinking levels ---
+
+
+def make_level_model(name: str, **kwargs) -> LitellmModel:
+    return LitellmModel(model_name=name, model_kwargs=dict(GO_KWARGS), cost_tracking="ignore_errors", **kwargs)
+
+
+def test_thinking_levels_come_from_model_config():
+    model = make_level_model("opencode_go/glm-5.3", thinking_levels=["max", "high", "low"])
+    assert model.get_thinking_levels() == ["max", "high", "low"]
+
+
+def test_thinking_levels_read_from_registry_levels(monkeypatch):
+    metadata = {"reasoning_effort_levels": ["low", "high", "medium"]}
+    monkeypatch.setattr("litellm.get_model_info", lambda *a, **k: metadata)
+    # normalised to highest-first and deduplicated
+    assert make_level_model("some/model").get_thinking_levels() == ["high", "medium", "low"]
+
+
+def test_thinking_levels_fall_back_to_support_flags(monkeypatch):
+    metadata = {"supports_low_reasoning_effort": True, "supports_high_reasoning_effort": True}
+    monkeypatch.setattr("litellm.get_model_info", lambda *a, **k: metadata)
+    assert make_level_model("some/model").get_thinking_levels() == ["high", "low"]
+
+
+def test_thinking_levels_empty_when_model_does_not_reason(monkeypatch):
+    monkeypatch.setattr("litellm.get_model_info", lambda *a, **k: {"supports_reasoning": False})
+    assert make_level_model("some/model").get_thinking_levels() == []
+
+
+def test_thinking_levels_unknown_for_unmapped_model(monkeypatch):
+    def raise_unmapped(*a, **k):
+        raise ValueError("not mapped")
+
+    monkeypatch.setattr("litellm.get_model_info", raise_unmapped)
+    assert make_level_model("some/unmapped").get_thinking_levels() is None
+
+
+def test_apply_profile_does_not_inherit_previous_models_levels():
+    model = LitellmModel(
+        model_name="opencode_go/glm-5.3",
+        model_kwargs=dict(GO_KWARGS) | {"reasoning_effort": "high"},
+        cost_tracking="default",
+        model_profiles={
+            "levels": {"model_name": "opencode_go/glm-5.3", "thinking_levels": ["max", "high", "low"]},
+            "plain": {"model_name": "opencode_go/longcat-2.5-free", "cost_tracking": "ignore_errors"},
+        },
+    )
+    model.apply_profile("levels")
+    assert model.get_thinking_levels() == ["max", "high", "low"]
+    model.apply_profile("plain")
+    assert model.config.thinking_levels is None
+    assert model.config.cost_tracking == "ignore_errors"
+
+
+def test_apply_profile_coerces_unsupported_effort():
+    model = LitellmModel(
+        model_name="opencode_go/glm-5.3",
+        model_kwargs=dict(GO_KWARGS) | {"reasoning_effort": "minimal"},
+        cost_tracking="default",
+        model_profiles={"glm": {"model_name": "opencode_go/glm-5.3", "thinking_levels": ["max", "high", "low"]}},
+    )
+    assert model.config.model_kwargs["reasoning_effort"] == "minimal"
+    model.apply_profile("glm")
+    assert model.config.model_kwargs["reasoning_effort"] == "high"

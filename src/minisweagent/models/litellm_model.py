@@ -45,6 +45,11 @@ class LitellmModelConfig(BaseModel):
     """Cost tracking mode for this model. Can be "default" or "ignore_errors" (ignore errors/missing cost info)"""
     context_window: int | None = None
     """Context window in tokens, for the status footer. Looked up from litellm's registry when unset."""
+    thinking_levels: list[str] | None = None
+    """Reasoning effort levels this model accepts, highest first (e.g. `["high", "low"]`).
+
+    Discovered from litellm's registry when unset. `[]` means the model takes no reasoning parameter.
+    """
     pricing: dict[str, float] | None = None
     """Price overrides in USD per million tokens: `input`, `output`, `cache_read`, `cache_write`.
 
@@ -94,6 +99,32 @@ class LitellmModel:
                 info = {}
             self._context_window_cache = int(info.get("max_input_tokens") or 0)
         return self._context_window_cache or None
+
+    _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def get_thinking_levels(self) -> list[str] | None:
+        """Reasoning levels the model accepts, highest first. `None` when it cannot be determined."""
+        if self.config.thinking_levels is not None:
+            levels = [str(level).strip().lower() for level in self.config.thinking_levels]
+            return [level for i, level in enumerate(levels) if level and level not in levels[:i]]
+        try:
+            info = litellm.get_model_info(self.config.model_name)
+        except Exception:
+            return None
+        reported = info.get("reasoning_effort_levels")
+        if isinstance(reported, (list, tuple)) and reported:
+            levels = {str(level).lower() for level in reported}
+            return [level for level in reversed(self._EFFORT_ORDER) if level in levels]
+        supported = {
+            level
+            for level in self._EFFORT_ORDER
+            if info.get(f"supports_{level}_reasoning_effort") in (True, "true", "True")
+        }
+        if supported:
+            return [level for level in reversed(self._EFFORT_ORDER) if level in supported]
+        if info.get("supports_reasoning") is False:
+            return []
+        return None
 
     @staticmethod
     def _extract_usage(response) -> dict[str, int]:
@@ -175,11 +206,26 @@ class LitellmModel:
         """Switch this model to a named entry from `config.model_profiles` in place. Returns its model name."""
         if name not in self.config.model_profiles:
             raise KeyError(name)
+        # A profile fully owns these fields: reset them so switching to a model that does not
+        # mention, say, `thinking_levels` does not inherit the previous model's levels.
+        for field in ("model_name", "model_kwargs", "cost_tracking", "pricing", "thinking_levels", "context_window"):
+            info = type(self.config).model_fields[field]
+            setattr(self.config, field, info.get_default(call_default_factory=True))
         for field, value in self.config.model_profiles[name].items():
             if field not in type(self.config).model_fields:
                 raise ValueError(f"Unknown field {field!r} in model profile {name!r}")
             setattr(self.config, field, value)
+        self._reconcile_thinking_level()
         return self.config.model_name
+
+    def _reconcile_thinking_level(self) -> None:
+        """Drop or adjust `reasoning_effort` so it stays valid for the active model."""
+        levels = self.get_thinking_levels()
+        kwargs = self.config.model_kwargs
+        if levels == []:
+            kwargs.pop("reasoning_effort", None)
+        elif levels and kwargs.get("reasoning_effort") not in levels:
+            kwargs["reasoning_effort"] = "high" if "high" in levels else levels[0]
 
     def _per_token_prices(self) -> dict[str, float] | None:
         """USD per token for input/output/cache_read/cache_write, from config overrides or litellm's registry."""

@@ -336,6 +336,14 @@ class InteractiveAgent(DefaultAgent):
                     itype="UserRejection",
                 )
 
+    def _thinking_levels(self) -> list[str]:
+        """Levels the active model accepts, from the model when it can report them."""
+        if callable(getattr(self.model, "get_thinking_levels", None)):
+            levels = self.model.get_thinking_levels()
+            if levels is not None:
+                return list(levels)
+        return list(self._THINKING_LEVELS)
+
     def _thinking_level(self) -> str:
         """Current `reasoning_effort` sent to the model ("unset" if the model has no model_kwargs)."""
         try:
@@ -354,8 +362,11 @@ class InteractiveAgent(DefaultAgent):
         console.print(f"Thinking level: [bold green]{level}[/bold green]")
 
     def _cycle_thinking_level(self) -> None:
+        levels = self._thinking_levels()
+        if not levels:
+            console.print("[bold yellow]This model accepts no reasoning level.[/bold yellow]")
+            return
         current = self._thinking_level()
-        levels = self._THINKING_LEVELS
         next_level = levels[(levels.index(current) + 1) % len(levels)] if current in levels else levels[0]
         self._set_thinking_level(next_level)
 
@@ -369,7 +380,10 @@ class InteractiveAgent(DefaultAgent):
         else:
             console.print(f"Model: [bold green]{escape(self._current_model_name())}[/bold green]")
 
-        levels = self._THINKING_LEVELS
+        levels = self._thinking_levels()
+        if not levels:
+            console.print("[yellow]This model accepts no reasoning level, skipping.[/yellow]")
+            return
         current = self._thinking_level()
         listing = "  ".join(
             f"[bold green]{i}[/bold green]. {level}" + (" [dim](current)[/dim]" if level == current else "")
@@ -532,22 +546,23 @@ class InteractiveAgent(DefaultAgent):
                 f"[bold green]/u[/bold green] to switch to [bold yellow]human[/bold yellow] mode (execute commands issued by the user)\n"
                 f"[bold green]/m[/bold green] to enter multiline comment\n"
                 f"[bold green]/e[/bold green] to cycle the thinking level (currently [bold green]{self._thinking_level()}[/bold green]: "
-                f"{' -> '.join(self._THINKING_LEVELS)})\n"
-                f"[bold green]/e <level>[/bold green] to set it directly (e.g. [bold green]/e none[/bold green] to disable thinking)\n"
+                f"{' -> '.join(self._thinking_levels()) or 'none supported'})\n"
+                f"[bold green]/e <level>[/bold green] to set it directly (e.g. [bold green]/e low[/bold green])\n"
                 f"[bold green]/model[/bold green] to pick another model from `model_profiles` "
                 f"(currently [bold green]{escape(self._current_model_name())}[/bold green])",
             )
             return self._prompt_and_handle_slash_commands(prompt)
         if user_input == "/e" or user_input.startswith("/e "):
             level = user_input[2:].strip().lower()
+            levels = self._thinking_levels()
             if not level:
                 self._cycle_thinking_level()
-            elif level in self._THINKING_LEVELS:
+            elif level in levels:
                 self._set_thinking_level(level)
             else:
                 console.print(
                     f"[bold red]Unknown thinking level '{escape(level)}'.[/bold red] "
-                    f"Choose one of: {', '.join(self._THINKING_LEVELS)}"
+                    f"Choose one of: {', '.join(levels) or '(this model accepts none)'}"
                 )
             return self._prompt_and_handle_slash_commands(prompt)
         if user_input == "/model" or user_input.startswith("/model "):
