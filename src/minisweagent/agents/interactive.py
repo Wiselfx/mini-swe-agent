@@ -6,11 +6,13 @@ There are three modes:
 - yolo: commands issued by the LM are executed immediately without confirmation
 """
 
+import os
 import re
 import sys
 from typing import Literal, NoReturn
 
 from rich.console import Console
+from rich.markup import escape
 from rich.rule import Rule
 
 from minisweagent.agents.default import AgentConfig, DefaultAgent
@@ -21,6 +23,18 @@ from minisweagent.models.utils.content_string import get_content_string
 console = Console(highlight=False)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean-ish environment variable ("0", "false", "no", "off" are falsy)."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _indent(text: str, prefix: str = "  ") -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
 class InteractiveAgentConfig(AgentConfig):
     mode: Literal["human", "confirm", "yolo"] = "confirm"
     """Whether to confirm actions."""
@@ -28,6 +42,8 @@ class InteractiveAgentConfig(AgentConfig):
     """Never confirm actions that match these regular expressions."""
     confirm_exit: bool = True
     """If the agent wants to finish, do we ask for confirmation from user?"""
+    show_observations: bool = not _env_flag("MSWEA_QUIET")
+    """Print tool results (command output) to the terminal. Disable with MSWEA_QUIET=1."""
 
 
 class InteractiveAgent(DefaultAgent):
@@ -40,16 +56,43 @@ class InteractiveAgent(DefaultAgent):
     def _interrupt(self, content: str, *, itype: str = "UserInterruption") -> NoReturn:
         raise UserInterruption({"role": "user", "content": content, "extra": {"interrupt_type": itype}})
 
+    def _print_tool_calls(self, message: dict) -> None:
+        """Print which tool was called and with what arguments (never the result)."""
+        if self.config.mode == "confirm":
+            # The confirmation prompt lists the commands that are about to run, no need to repeat them
+            return
+        for action in message.get("extra", {}).get("actions", []):
+            command = action.get("command", "")
+            if "\n" in command.strip():
+                console.print(f"[cyan]bash[/cyan][dim] ($)[/dim]")
+                console.print(_indent(command.rstrip()), highlight=False, markup=False, style="dim")
+            else:
+                console.print(
+                    f"[cyan]bash[/cyan][dim] ($)[/dim] {escape(command)}", highlight=False
+                )
+
     def add_messages(self, *messages: dict) -> list[dict]:
         # Extend supermethod to print messages
         for msg in messages:
             role, content = msg.get("role") or msg.get("type", "unknown"), get_content_string(msg)
+            if role == "tool" and not self.config.show_observations:
+                # Hide the command output, keep the exit code so failures stay visible
+                returncode = msg.get("extra", {}).get("returncode")
+                console.print(f"[dim]↳ exit {returncode} (output hidden, MSWEA_QUIET=0 to show)[/dim]", highlight=False)
+                continue
             if role == "assistant":
                 console.print(
                     f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.n_calls}[/bold], [bold]${self.cost:.2f}[/bold]):[/red]\n",
                     end="",
                     highlight=False,
                 )
+                if not self.config.show_observations:
+                    # Reasoning first, then an explicit "tool + command" line instead of the raw block
+                    reasoning = (msg.get("content") or "").strip() if isinstance(msg.get("content"), str) else ""
+                    if reasoning:
+                        console.print(reasoning, highlight=False, markup=False)
+                    self._print_tool_calls(msg)
+                    continue
             else:
                 console.print(f"\n[bold green]{role.capitalize()}[/bold green]:\n", end="", highlight=False)
             console.print(content, highlight=False, markup=False)
@@ -165,6 +208,12 @@ class InteractiveAgent(DefaultAgent):
     def _ask_confirmation_or_interrupt(self, commands: list[str]) -> None:
         if not any(self._should_ask_confirmation(c) for c in commands):
             return
+        console.print(f"\n[bold yellow]Agent wants to run {len(commands)} action(s):[/bold yellow]")
+        for command in commands:
+            if "\n" in command.strip():
+                console.print(_indent(command.rstrip()), highlight=False, markup=False, style="cyan")
+            else:
+                console.print(f"  [cyan]{escape(command)}[/cyan]", highlight=False)
         prompt = (
             f"[bold yellow]Execute {len(commands)} action(s)?[/] [green][bold]Enter[/] to confirm[/], "
             "[red]type [bold]comment[/] to reject[/], or [blue][bold]/h[/] to show available commands[/]\n"
