@@ -35,6 +35,52 @@ def _indent(text: str, prefix: str = "  ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+_MAX_PREVIEW_LINE_CHARS = 200
+
+
+def _shorten(line: str, limit: int = _MAX_PREVIEW_LINE_CHARS) -> str:
+    """Keep one pathological line (a minified bundle, a 500k-char JSON blob) from filling the screen."""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _get_text(message: dict) -> str:
+    """The message's plain reply text, without tool calls folded in (get_content_string does that)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") in (None, "text")
+        ]
+        return "\n\n".join(p for p in parts if p).strip()
+    return ""
+
+
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
+
+def _get_reasoning(message: dict) -> str:
+    """Pull the model's thinking out of whatever field the provider used.
+
+    litellm normalizes most providers to ``reasoning_content``, but ``reasoning``
+    and ``thinking`` show up too.
+    """
+    for key in _REASONING_KEYS:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):  # e.g. [{"type": "thinking", "thinking": "..."}]
+            parts = [v.get("thinking") or v.get("text") or "" for v in value if isinstance(v, dict)]
+            if joined := "".join(parts).strip():
+                return joined
+        if isinstance(value, dict) and (text := (value.get("text") or value.get("content") or "").strip()):
+            return text
+    return ""
+
+
 class InteractiveAgentConfig(AgentConfig):
     mode: Literal["human", "confirm", "yolo"] = "confirm"
     """Whether to confirm actions."""
@@ -43,11 +89,24 @@ class InteractiveAgentConfig(AgentConfig):
     confirm_exit: bool = True
     """If the agent wants to finish, do we ask for confirmation from user?"""
     show_observations: bool = not _env_flag("MSWEA_QUIET")
-    """Print tool results (command output) to the terminal. Disable with MSWEA_QUIET=1."""
+    """Print the full tool output. When False, print a head/tail preview instead (MSWEA_QUIET=1)."""
+    observation_preview_lines: int = 4
+    """Lines shown from the top and from the bottom of a truncated tool output."""
+
+
+def _fmt_tokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}k"
+    return str(count)
 
 
 class InteractiveAgent(DefaultAgent):
     _MODE_COMMANDS_MAPPING = {"/u": "human", "/c": "confirm", "/y": "yolo"}
+    # Cycle order for /e. "none" disables thinking entirely; the rest are passed as
+    # `reasoning_effort` (levels servers do not implement are ignored or dropped).
+    _THINKING_LEVELS = ("high", "medium", "low", "minimal", "none")
 
     def __init__(self, *args, config_class=InteractiveAgentConfig, **kwargs):
         super().__init__(*args, config_class=config_class, **kwargs)
@@ -71,31 +130,62 @@ class InteractiveAgent(DefaultAgent):
                     f"[cyan]bash[/cyan][dim] ($)[/dim] {escape(command)}", highlight=False
                 )
 
+    def _print_observation(self, message: dict) -> None:
+        """Print the exit code plus a head/tail preview of the command output."""
+        extra = message.get("extra", {})
+        returncode = extra.get("returncode")
+        outcome = "not executed" if returncode in (None, -1) else f"exit {returncode}"
+        console.print(f"[dim]↳ {outcome}[/dim]", highlight=False)
+
+        output = extra.get("raw_output")
+        if not isinstance(output, str):
+            output = get_content_string(message)
+        output = output.strip("\n")
+        if not output.strip():
+            return
+
+        limit = max(1, self.config.observation_preview_lines)
+        width = max(20, min(_MAX_PREVIEW_LINE_CHARS, console.width - 2))
+        lines = [_shorten(line, width) for line in output.splitlines()]
+        if len(lines) <= 2 * limit:
+            visible, elided = lines, 0
+        else:
+            visible = lines[:limit] + [None] + lines[-limit:]
+            elided = len(lines) - 2 * limit
+
+        for line in visible:
+            if line is None:
+                console.print(f"[dim]  … {elided} lines elided …[/dim]", highlight=False)
+            else:
+                console.print(f"  {line}", highlight=False, markup=False)
+
     def add_messages(self, *messages: dict) -> list[dict]:
         # Extend supermethod to print messages
         for msg in messages:
             role, content = msg.get("role") or msg.get("type", "unknown"), get_content_string(msg)
-            if role == "tool" and not self.config.show_observations:
-                # Hide the command output, keep the exit code so failures stay visible
-                returncode = msg.get("extra", {}).get("returncode")
-                console.print(f"[dim]↳ exit {returncode} (output hidden, MSWEA_QUIET=0 to show)[/dim]", highlight=False)
-                continue
-            if role == "assistant":
+            if role == "tool":
+                if not self.config.show_observations:
+                    self._print_observation(msg)
+                    continue
+            elif role == "assistant":
                 console.print(
-                    f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.n_calls}[/bold], [bold]${self.cost:.2f}[/bold]):[/red]\n",
+                    f"\n[red][bold]mini-swe-agent[/bold]:[/red]\n",
                     end="",
                     highlight=False,
                 )
+                if reasoning := _get_reasoning(msg):
+                    console.print(reasoning, style="dim italic", highlight=False, markup=False)
                 if not self.config.show_observations:
-                    # Reasoning first, then an explicit "tool + command" line instead of the raw block
-                    reasoning = (msg.get("content") or "").strip() if isinstance(msg.get("content"), str) else ""
-                    if reasoning:
-                        console.print(reasoning, highlight=False, markup=False)
+                    # Print the reply text, then an explicit "tool + command" line instead of the raw block
+                    if text := _get_text(msg):
+                        console.print(text, highlight=False, markup=False)
                     self._print_tool_calls(msg)
                     continue
             else:
                 console.print(f"\n[bold green]{role.capitalize()}[/bold green]:\n", end="", highlight=False)
-            console.print(content, highlight=False, markup=False)
+            if content.strip():  # e.g. the final "exit" message carries no text
+                console.print(content, highlight=False, markup=False)
+        return super().add_messages(*messages)
         return super().add_messages(*messages)
 
     def query(self) -> dict:
@@ -151,18 +241,23 @@ class InteractiveAgent(DefaultAgent):
 
     def step(self) -> list[dict]:
         # Override the step method to handle user interruption
+        console.print(Rule())
+        result: list[dict] = []
         try:
-            console.print(Rule())
-            return super().step()
+            result = super().step()
         except KeyboardInterrupt:
             interruption_message = self._prompt_and_handle_slash_commands(
                 "\n\n[bold yellow]Interrupted.[/bold yellow] "
-                "[green]Type a comment/command[/green] (/h for available commands)"
-                "\n[bold yellow]>[/bold yellow] "
+                "[green]Type a comment/command[/green] (/h for available commands)\n"
+                "[bold yellow]>[/bold yellow] "
             ).strip()
             if not interruption_message or interruption_message in self._MODE_COMMANDS_MAPPING:
                 interruption_message = "Temporary interruption caught."
             self._interrupt(f"Interrupted by user: {interruption_message}")
+        finally:
+            if self.messages:
+                self._print_footer()
+        return result
 
     def execute_actions(self, message: dict) -> list[dict]:
         # Override to handle user confirmation and confirm_exit, with try/finally to preserve partial outputs
@@ -230,6 +325,173 @@ class InteractiveAgent(DefaultAgent):
                     itype="UserRejection",
                 )
 
+    def _thinking_level(self) -> str:
+        """Current `reasoning_effort` sent to the model ("unset" if the model has no model_kwargs)."""
+        try:
+            return str(self.model.config.model_kwargs.get("reasoning_effort", "unset"))
+        except AttributeError:
+            return "unset"
+
+    def _set_thinking_level(self, level: str) -> None:
+        try:
+            self.model.config.model_kwargs["reasoning_effort"] = level
+        except (AttributeError, TypeError, ValueError):
+            console.print(
+                "[bold red]This model class does not expose model_kwargs, cannot switch thinking level.[/bold red]"
+            )
+            return
+        console.print(f"Thinking level: [bold green]{level}[/bold green]")
+
+    def _cycle_thinking_level(self) -> None:
+        current = self._thinking_level()
+        levels = self._THINKING_LEVELS
+        next_level = levels[(levels.index(current) + 1) % len(levels)] if current in levels else levels[0]
+        self._set_thinking_level(next_level)
+
+    def preflight(self) -> None:
+        """Pick model and thinking level before the task prompt. Enter keeps the current value."""
+        if self._model_profiles():
+            self._print_model_picker()
+            choice = prompt_session.prompt("Model (number/name, Enter to keep): ").strip()
+            if choice:
+                self._handle_model_command(choice)
+        else:
+            console.print(f"Model: [bold green]{escape(self._current_model_name())}[/bold green]")
+
+        levels = self._THINKING_LEVELS
+        current = self._thinking_level()
+        listing = "  ".join(
+            f"[bold green]{i}[/bold green]. {level}" + (" [dim](current)[/dim]" if level == current else "")
+            for i, level in enumerate(levels, 1)
+        )
+        console.print(f"Thinking level:\n{listing}")
+        choice = prompt_session.prompt("Thinking (number/name, Enter to keep): ").strip()
+        if not choice:
+            return
+        if choice.isdigit() and 1 <= int(choice) <= len(levels):
+            choice = levels[int(choice) - 1]
+        if choice.lower() in levels:
+            self._set_thinking_level(choice.lower())
+        else:
+            console.print(
+                f"[bold red]Unknown thinking level '{escape(choice)}'.[/bold red] "
+                f"Choose one of: {', '.join(levels)}"
+            )
+
+    def _usage_totals(self) -> dict[str, int]:
+        totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0}
+        context_tokens = 0
+        for message in self.messages:
+            usage = (message.get("extra") or {}).get("usage")
+            if not isinstance(usage, dict):
+                continue
+            for key in totals:
+                totals[key] += int(usage.get(key) or 0)
+            if usage.get("prompt_tokens"):
+                context_tokens = int(usage["prompt_tokens"]) + int(usage.get("completion_tokens") or 0)
+        totals["context_tokens"] = context_tokens
+        return totals
+
+    def _active_profile_name(self) -> str | None:
+        model_name = self._current_model_name()
+        for name, profile in self._model_profiles().items():
+            if profile.get("model_name") == model_name:
+                return name
+        return None
+
+    def _footer_segments(self) -> list[str]:
+        usage = self._usage_totals()
+        label = self._active_profile_name() or self._current_model_name()
+        segments = [label, f"step {self.n_calls}", f"${self.cost:.4f}"]
+
+        window = 0
+        if callable(getattr(self.model, "get_context_window", None)):
+            window = self.model.get_context_window()
+        window = window if isinstance(window, int) else 0
+        if usage["context_tokens"]:
+            if window:
+                pct = 100 * usage["context_tokens"] / window
+                segments.append(f"ctx {_fmt_tokens(usage['context_tokens'])}/{_fmt_tokens(window)} {pct:.0f}%")
+            else:
+                segments.append(f"ctx {_fmt_tokens(usage['context_tokens'])}")
+
+        if usage["prompt_tokens"]:
+            hit = 100 * usage["cached_tokens"] / usage["prompt_tokens"]
+            segments.append(f"cache {_fmt_tokens(usage['cached_tokens'])} read, {hit:.0f}% hit")
+            if usage["cache_write_tokens"]:
+                segments.append(f"{_fmt_tokens(usage['cache_write_tokens'])} written")
+        return segments
+
+    def _print_footer(self) -> None:
+        segments = self._footer_segments()
+        # Skip repeated footers (e.g. a step that aborted on a limit before doing any work)
+        signature = (tuple(segments), len(self.messages))
+        if signature == getattr(self, "_last_footer", None):
+            return
+        self._last_footer = signature
+        console.print(f"[dim]{escape('  │  '.join(segments))}[/dim]", highlight=False)
+
+    def _model_profiles(self) -> dict[str, dict]:
+        profiles = getattr(getattr(self.model, "config", None), "model_profiles", None)
+        return dict(profiles) if isinstance(profiles, dict) else {}
+
+    def _current_model_name(self) -> str:
+        return str(getattr(getattr(self.model, "config", None), "model_name", "unknown"))
+
+    def _print_model_picker(self) -> None:
+        profiles = self._model_profiles()
+        if not profiles:
+            console.print(
+                "[bold yellow]No model profiles configured.[/bold yellow] Add `model_profiles` "
+                "to your config file, then run /model again."
+            )
+            return
+        current = self._current_model_name()
+        col = max(len(name) for name in profiles) + 2
+        room = max(20, console.width - col - 20)
+        lines = []
+        for i, (name, profile) in enumerate(profiles.items(), 1):
+            model_name = _shorten(str(profile.get("model_name", current)), room)
+            marker = " [dim](current)[/dim]" if profile.get("model_name", current) == current else ""
+            lines.append(f"[bold green]{i}[/bold green]. {name.ljust(col)}[dim]{escape(model_name)}[/dim]{marker}")
+        console.print("Available models:\n" + "\n".join(lines))
+
+    def _apply_model_profile(self, name: str) -> None:
+        profiles = self._model_profiles()
+        if name not in profiles:
+            console.print(
+                f"[bold red]Unknown model profile '{escape(name)}'.[/bold red] "
+                f"Choose one of: {', '.join(profiles) or '(none configured)'}"
+            )
+            return
+        try:
+            model_name = self.model.apply_profile(name)
+        except (AttributeError, KeyError, ValueError) as e:
+            console.print(f"[bold red]Could not switch model: {escape(str(e))}[/bold red]")
+            return
+        console.print(f"Model: [bold green]{escape(name)}[/bold green] [dim]({escape(str(model_name))})[/dim]")
+
+    def _handle_model_command(self, argument: str) -> None:
+        profiles = self._model_profiles()
+        if not profiles:
+            self._print_model_picker()
+            return
+        argument = argument.strip()
+        if not argument:
+            self._print_model_picker()
+            argument = prompt_session.prompt("Number or name (Enter to cancel): ").strip()
+            if not argument:
+                return
+        if argument.isdigit() and 1 <= int(argument) <= len(profiles):
+            argument = list(profiles)[int(argument) - 1]
+        matched = [name for name in profiles if name.lower() == argument.lower()]
+        if not matched:
+            matched = [name for name in profiles if name.lower().startswith(argument.lower())]
+        if len(matched) != 1:
+            self._apply_model_profile(argument)
+            return
+        self._apply_model_profile(matched[0])
+
     def _prompt_and_handle_slash_commands(self, prompt: str, *, _multiline: bool = False) -> str:
         """Prompts the user, takes care of /h (followed by requery) and sets the mode. Returns the user input."""
         console.print(prompt, end="")
@@ -244,8 +506,28 @@ class InteractiveAgent(DefaultAgent):
                 f"[bold green]/y[/bold green] to switch to [bold yellow]yolo[/bold yellow] mode (execute LM commands without confirmation)\n"
                 f"[bold green]/c[/bold green] to switch to [bold yellow]confirmation[/bold yellow] mode (ask for confirmation before executing LM commands)\n"
                 f"[bold green]/u[/bold green] to switch to [bold yellow]human[/bold yellow] mode (execute commands issued by the user)\n"
-                f"[bold green]/m[/bold green] to enter multiline comment",
+                f"[bold green]/m[/bold green] to enter multiline comment\n"
+                f"[bold green]/e[/bold green] to cycle the thinking level (currently [bold green]{self._thinking_level()}[/bold green]: "
+                f"{' -> '.join(self._THINKING_LEVELS)})\n"
+                f"[bold green]/e <level>[/bold green] to set it directly (e.g. [bold green]/e none[/bold green] to disable thinking)\n"
+                f"[bold green]/model[/bold green] to pick another model from `model_profiles` "
+                f"(currently [bold green]{escape(self._current_model_name())}[/bold green])",
             )
+            return self._prompt_and_handle_slash_commands(prompt)
+        if user_input == "/e" or user_input.startswith("/e "):
+            level = user_input[2:].strip().lower()
+            if not level:
+                self._cycle_thinking_level()
+            elif level in self._THINKING_LEVELS:
+                self._set_thinking_level(level)
+            else:
+                console.print(
+                    f"[bold red]Unknown thinking level '{escape(level)}'.[/bold red] "
+                    f"Choose one of: {', '.join(self._THINKING_LEVELS)}"
+                )
+            return self._prompt_and_handle_slash_commands(prompt)
+        if user_input == "/model" or user_input.startswith("/model "):
+            self._handle_model_command(user_input[6:].strip())
             return self._prompt_and_handle_slash_commands(prompt)
         if user_input in self._MODE_COMMANDS_MAPPING:
             if self.config.mode == self._MODE_COMMANDS_MAPPING[user_input]:

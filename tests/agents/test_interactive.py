@@ -1254,3 +1254,121 @@ def test_submission_enter_quits(model_factory):
     assert info["exit_status"] == "Submitted"
     assert info["submission"] == "completed\n"
     assert agent.n_calls == 1
+
+
+# --- Runtime model/thinking controls (/model, /e) ---
+
+
+def _profiled_agent(**overrides):
+    """Interactive agent on a (never-queried) LitellmModel carrying model profiles."""
+    from minisweagent.models.litellm_model import LitellmModel
+
+    config = {
+        "model_name": "opencode_go/beam-free",
+        "model_kwargs": {"drop_params": True},
+        "cost_tracking": "ignore_errors",
+        "model_profiles": {
+            "local": {
+                "model_name": "openai/local-model",
+                "model_kwargs": {"api_base": "http://localhost:1234/v1", "api_key": "not-needed"},
+                "cost_tracking": "ignore_errors",
+            },
+            "free": {"model_name": "opencode_go/beam-free", "cost_tracking": "ignore_errors"},
+            "paid": {"model_name": "opencode_go/glm-5.3", "cost_tracking": "default"},
+        },
+        **overrides,
+    }
+    return InteractiveAgent(
+        LitellmModel(**config),
+        LocalEnvironment(),
+        mode="yolo",
+        confirm_exit=False,
+        output_path=None,
+        cost_limit=0,
+        step_limit=0,
+        system_template="s",
+        instance_template="{{task}}",
+    )
+
+
+def test_model_picker_switches_by_number(capsys):
+    agent = _profiled_agent()
+    with mock_prompts(["1"]):
+        agent._handle_model_command("")
+    out = capsys.readouterr().out
+    assert "Available models" in out
+    assert agent.model.config.model_name == "openai/local-model"
+    # profile kwargs and cost tracking replace the previous ones wholesale
+    assert agent.model.config.model_kwargs["api_base"] == "http://localhost:1234/v1"
+    assert agent.model.config.cost_tracking == "ignore_errors"
+
+
+def test_model_picker_matches_by_name_prefix():
+    agent = _profiled_agent()
+    agent._handle_model_command("pa")
+    assert agent.model.config.model_name == "opencode_go/glm-5.3"
+    assert agent.model.config.cost_tracking == "default"
+
+
+def test_model_picker_rejects_unknown_profile(capsys):
+    agent = _profiled_agent()
+    agent._handle_model_command("nope")
+    assert "Unknown model profile" in capsys.readouterr().out
+    assert agent.model.config.model_name == "opencode_go/beam-free"
+
+
+def test_model_picker_without_profiles_prints_hint(capsys):
+    agent = _profiled_agent(model_profiles={})
+    agent._handle_model_command("")
+    assert "No model profiles configured" in capsys.readouterr().out
+
+
+def test_e_command_cycles_thinking_level():
+    agent = _profiled_agent(model_kwargs={"reasoning_effort": "high"})
+    assert agent._thinking_level() == "high"
+    agent._cycle_thinking_level()
+    assert agent._thinking_level() == "medium"
+    agent._set_thinking_level("none")
+    assert agent.model.config.model_kwargs["reasoning_effort"] == "none"
+
+
+def test_preflight_selects_model_and_effort():
+    agent = _profiled_agent(model_kwargs={"reasoning_effort": "high"})
+    with mock_prompts(["2", "2"]):  # profile #2 = free/beam-free, level #2 = medium
+        agent.preflight()
+    assert agent.model.config.model_name == "opencode_go/beam-free"
+    assert agent.model.config.model_kwargs["reasoning_effort"] == "medium"
+
+
+def test_preflight_enter_keeps_current_choices(capsys):
+    agent = _profiled_agent(model_kwargs={"reasoning_effort": "high"})
+    with mock_prompts(["", ""]):
+        agent.preflight()
+    assert agent.model.config.model_name == "opencode_go/beam-free"
+    assert agent.model.config.model_kwargs["reasoning_effort"] == "high"
+    out = capsys.readouterr().out
+    assert "Available models" in out and "Thinking level" in out
+
+
+def test_footer_reports_model_step_cost_context_and_cache():
+    agent = _profiled_agent(context_window=8000, model_kwargs={"reasoning_effort": "high"})
+    agent.n_calls, agent.cost = 3, 0.0123
+    agent.messages = [
+        {"role": "assistant", "extra": {"usage": {"prompt_tokens": 1000, "completion_tokens": 50,
+                                                  "cached_tokens": 400, "cache_write_tokens": 0}}},
+        {"role": "assistant", "extra": {"usage": {"prompt_tokens": 1150, "completion_tokens": 50,
+                                                  "cached_tokens": 900, "cache_write_tokens": 128}}},
+    ]
+    footer = "  │  ".join(agent._footer_segments())
+    assert "free" in footer  # active profile name, not the raw provider id
+    assert "step 3" in footer and "$0.0123" in footer
+    assert "ctx 1.2k/8.0k 15%" in footer
+    assert "cache 1.3k read" in footer and "% hit" in footer
+    assert "128 written" in footer
+
+
+def test_footer_omits_context_without_usage_data():
+    agent = _profiled_agent()
+    agent.n_calls, agent.cost = 1, 0.0
+    footer = "  │  ".join(agent._footer_segments())
+    assert "ctx" not in footer and "cache" not in footer

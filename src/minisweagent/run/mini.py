@@ -4,6 +4,7 @@
 # Read this first: https://mini-swe-agent.com/latest/usage/mini/  (usage)
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -92,13 +93,19 @@ def main(
     config = recursive_merge(*configs)
 
     if (run_task := config.get("run", {}).get("task", UNSET)) is UNSET:
-        console.print("[bold yellow]What do you want to do?")
-        run_task = _multiline_prompt()
-        console.print("[bold green]Got that, thanks![/bold green]")
+        run_task = UNSET  # prompted for below, after model/effort selection
 
     model = get_model(config=config.get("model", {}))
     env = get_environment(config.get("environment", {}), default_type="local")
     agent = get_agent(model, env, config.get("agent", {}), default_type="interactive")
+
+    if run_task is UNSET:
+        if getattr(agent, "preflight", None) and sys.stdin.isatty():
+            agent.preflight()
+        console.print("[bold yellow]What do you want to do?[/bold yellow]")
+        run_task = _multiline_prompt()
+        console.print("[bold green]Got that, thanks![/bold green]")
+
     agent.run(run_task)
     if (output_path := config.get("agent", {}).get("output_path")):
         console.print(f"Saved trajectory to [bold green]'{output_path}'[/bold green]")

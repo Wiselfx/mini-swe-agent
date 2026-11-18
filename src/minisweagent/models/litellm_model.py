@@ -23,6 +23,14 @@ from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
 
+if os.getenv("MSWEA_QUIET", "").strip().lower() not in {"", "0", "false", "no", "off"}:
+    # Quiet mode: litellm prints a "Provider List: ..." block whenever it cannot resolve
+    # cost metadata for an unregistered model (local servers, most often).
+    litellm.suppress_debug_info = True
+    # ...and a warning per call for every param its provider definition would drop,
+    # which is exactly what `drop_params: true` is for. Not worth a line per step.
+    logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+
 
 class LitellmModelConfig(BaseModel):
     model_name: str
@@ -35,6 +43,14 @@ class LitellmModelConfig(BaseModel):
     """Set explicit cache control markers, for example for Anthropic models"""
     cost_tracking: Literal["default", "ignore_errors"] = os.getenv("MSWEA_COST_TRACKING", "default")
     """Cost tracking mode for this model. Can be "default" or "ignore_errors" (ignore errors/missing cost info)"""
+    context_window: int | None = None
+    """Context window in tokens, for the status footer. Looked up from litellm's registry when unset."""
+    model_profiles: dict[str, dict[str, Any]] = {}
+    """Named alternate models, switchable at runtime with `/model` in interactive mode.
+
+    Each value is a dict of model config fields to override, e.g.
+    `{"beam-free": {"model_name": "opencode_go/beam-free", "cost_tracking": "ignore_errors"}}`.
+    """
     format_error_template: str = "{{ error }}"
     """Template used when the LM's output is not in the expected format."""
     observation_template: str = (
@@ -58,8 +74,51 @@ class LitellmModel:
 
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
         self.config = config_class(**kwargs)
+        self._context_window_cache: int | None = None
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
+
+    def get_context_window(self) -> int | None:
+        """Max input tokens for the current model, from config or litellm's registry."""
+        if self.config.context_window:
+            return self.config.context_window
+        if self._context_window_cache is None:
+            try:
+                info = litellm.get_model_info(self.config.model_name)
+            except Exception:
+                info = {}
+            self._context_window_cache = int(info.get("max_input_tokens") or 0)
+        return self._context_window_cache or None
+
+    @staticmethod
+    def _extract_usage(response) -> dict[str, int]:
+        """Normalize token accounting across OpenAI-style and Anthropic-style responses."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return {}
+
+        def get(*names: str) -> int:
+            for name in names:
+                value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+            return 0
+
+        try:
+            details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
+            cached = get("cache_read_input_tokens")
+            if not cached and details is not None:
+                value = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cached = int(value)
+            return {
+                "prompt_tokens": get("prompt_tokens", "input_tokens"),
+                "completion_tokens": get("completion_tokens", "output_tokens"),
+                "cached_tokens": cached,
+                "cache_write_tokens": get("cache_creation_input_tokens"),
+            }
+        except (TypeError, ValueError):
+            return {}
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
@@ -89,6 +148,7 @@ class LitellmModel:
             actions = self._parse_actions(response)
         except FormatError as e:
             e.messages[0]["extra"].update(cost_output)
+            e.messages[0]["extra"]["usage"] = self._extract_usage(response)
             try:
                 e.messages[0]["extra"]["response"] = response.model_dump(mode="json")
             except Exception:
@@ -100,10 +160,21 @@ class LitellmModel:
         message["extra"] = {
             "actions": actions,
             "response": response.model_dump(),
+            "usage": self._extract_usage(response),
             **cost_output,
             "timestamp": time.time(),
         }
         return message
+
+    def apply_profile(self, name: str) -> str:
+        """Switch this model to a named entry from `config.model_profiles` in place. Returns its model name."""
+        if name not in self.config.model_profiles:
+            raise KeyError(name)
+        for field, value in self.config.model_profiles[name].items():
+            if field not in type(self.config).model_fields:
+                raise ValueError(f"Unknown field {field!r} in model profile {name!r}")
+            setattr(self.config, field, value)
+        return self.config.model_name
 
     def _calculate_cost(self, response) -> dict[str, float]:
         try:
