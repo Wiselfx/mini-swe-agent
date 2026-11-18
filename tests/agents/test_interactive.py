@@ -1372,3 +1372,24 @@ def test_footer_omits_context_without_usage_data():
     agent.n_calls, agent.cost = 1, 0.0
     footer = "  │  ".join(agent._footer_segments())
     assert "ctx" not in footer and "cache" not in footer
+
+
+def test_footer_cost_keeps_sub_cent_amounts_visible():
+    agent = _profiled_agent()
+    agent.n_calls = 1
+    agent.messages = [{"role": "assistant", "extra": {"cost": 0.000135, "usage": {"prompt_tokens": 100}}}]
+    agent.cost = 0.0  # not yet charged (e.g. a FormatError still propagating)
+    footer = "  │  ".join(agent._footer_segments())
+    assert "$0.000135" in footer
+
+
+def test_footer_cost_is_not_stale_after_a_failed_call():
+    """The step footer prints before run() charges a FormatError, so it must read the messages."""
+    agent = _profiled_agent()
+    agent.n_calls = 2
+    agent.cost = 0.001
+    agent.messages = [
+        {"role": "assistant", "extra": {"cost": 0.001}},
+        {"role": "user", "extra": {"cost": 0.002}},  # failed call, charged later by run()
+    ]
+    assert "$0.003000" in "  │  ".join(agent._footer_segments())

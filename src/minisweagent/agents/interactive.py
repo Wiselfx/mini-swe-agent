@@ -94,6 +94,17 @@ class InteractiveAgentConfig(AgentConfig):
     """Lines shown from the top and from the bottom of a truncated tool output."""
 
 
+def _fmt_cost(cost: float) -> str:
+    """Keep sub-cent spend visible instead of rounding it to $0.0000."""
+    if cost == 0:
+        return "$0.00"
+    if cost < 0.01:
+        return f"${cost:.6f}"
+    if cost < 1:
+        return f"${cost:.4f}"
+    return f"${cost:.2f}"
+
+
 def _fmt_tokens(count: int) -> str:
     if count >= 1_000_000:
         return f"{count / 1_000_000:.1f}M"
@@ -378,6 +389,19 @@ class InteractiveAgent(DefaultAgent):
                 f"Choose one of: {', '.join(levels)}"
             )
 
+    def _total_cost(self) -> float:
+        """Sum the cost recorded on each message.
+
+        `self.cost` is only charged for a failed call once `run()` handles the FormatError, which
+        happens after the step's footer is printed, so summing the messages keeps it current.
+        """
+        recorded = sum(
+            float((message.get("extra") or {}).get("cost") or 0.0)
+            for message in self.messages
+            if isinstance(message.get("extra"), dict)
+        )
+        return max(recorded, self.cost)
+
     def _usage_totals(self) -> dict[str, int]:
         totals = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0}
         context_tokens = 0
@@ -402,7 +426,7 @@ class InteractiveAgent(DefaultAgent):
     def _footer_segments(self) -> list[str]:
         usage = self._usage_totals()
         label = self._active_profile_name() or self._current_model_name()
-        segments = [label, f"step {self.n_calls}", f"${self.cost:.4f}"]
+        segments = [label, f"step {self.n_calls}", _fmt_cost(self._total_cost())]
 
         window = 0
         if callable(getattr(self.model, "get_context_window", None)):

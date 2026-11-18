@@ -45,6 +45,11 @@ class LitellmModelConfig(BaseModel):
     """Cost tracking mode for this model. Can be "default" or "ignore_errors" (ignore errors/missing cost info)"""
     context_window: int | None = None
     """Context window in tokens, for the status footer. Looked up from litellm's registry when unset."""
+    pricing: dict[str, float] | None = None
+    """Price overrides in USD per million tokens: `input`, `output`, `cache_read`, `cache_write`.
+
+    Use when litellm's registry has no entry for the model, or when it disagrees with the bill.
+    """
     model_profiles: dict[str, dict[str, Any]] = {}
     """Named alternate models, switchable at runtime with `/model` in interactive mode.
 
@@ -176,9 +181,45 @@ class LitellmModel:
             setattr(self.config, field, value)
         return self.config.model_name
 
+    def _per_token_prices(self) -> dict[str, float] | None:
+        """USD per token for input/output/cache_read/cache_write, from config overrides or litellm's registry."""
+        if self.config.pricing:
+            return {key: float(value) / 1e6 for key, value in self.config.pricing.items()}
+        try:
+            info = litellm.get_model_info(self.config.model_name)
+        except Exception:
+            return None
+        if info.get("input_cost_per_token") is None or info.get("output_cost_per_token") is None:
+            return None
+        return {
+            "input": info["input_cost_per_token"],
+            "output": info["output_cost_per_token"],
+            "cache_read": info.get("cache_read_input_token_cost") or 0.0,
+            "cache_write": info.get("cache_creation_input_token_cost") or 0.0,
+        }
+
+    def _cost_from_usage(self, response) -> float | None:
+        """Cost including cache-read discounts. Returns None when the usage or prices are unusable."""
+        usage = self._extract_usage(response)
+        prices = self._per_token_prices()
+        prompt, completion = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+        if prices is None or not prompt:
+            return None
+        cached = usage.get("cached_tokens", 0)
+        return (
+            (prompt - cached) * prices["input"]
+            + cached * prices.get("cache_read", 0.0)
+            + completion * prices["output"]
+            + usage.get("cache_write_tokens", 0) * prices.get("cache_write", 0.0)
+        )
+
     def _calculate_cost(self, response) -> dict[str, float]:
         try:
-            cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
+            # litellm's calculator bills every prompt token at the full input price, which overstates
+            # cost badly on providers with a cheap cache-read rate (or with a wrong catalog entry).
+            cost = self._cost_from_usage(response)
+            if cost is None:
+                cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
             if cost <= 0.0:
                 raise ValueError(f"Cost must be > 0.0, got {cost}")
         except Exception as e:
