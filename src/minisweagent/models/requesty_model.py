@@ -111,6 +111,7 @@ class RequestyModel:
             e.messages[0]["extra"].update(cost_output)
             # dict(response) is a shallow copy; the original response object is not mutated.
             e.messages[0]["extra"]["response"] = dict(response)
+            e.messages = (dict(response["choices"][0]["message"]), *e.messages)
             raise
         message = dict(response["choices"][0]["message"])
         message["extra"] = {

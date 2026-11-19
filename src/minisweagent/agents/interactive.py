@@ -16,8 +16,16 @@ from rich.markup import escape
 from rich.rule import Rule
 
 from minisweagent.agents.default import AgentConfig, DefaultAgent
+from minisweagent.agents.utils.compaction import estimate_tokens
 from minisweagent.agents.utils.prompt_user import _multiline_prompt, prompt_session
-from minisweagent.exceptions import LimitsExceeded, Submitted, TimeExceeded, UserInterruption
+from minisweagent.exceptions import (
+    FormatError,
+    LimitsExceeded,
+    Submitted,
+    TimeExceeded,
+    UserInterruption,
+    WaitForUser,
+)
 from minisweagent.models.utils.content_string import get_content_string
 
 console = Console(highlight=False)
@@ -87,7 +95,12 @@ class InteractiveAgentConfig(AgentConfig):
     whitelist_actions: list[str] = []
     """Never confirm actions that match these regular expressions."""
     confirm_exit: bool = True
-    """If the agent wants to finish, do we ask for confirmation from user?"""
+    """If the agent wants to finish, do we ask for confirmation from user?
+    Also enables `echo WAIT_FOR_USER`, which hands the turn to the user without finishing."""
+    wait_for_user_hint: str = (
+        "If you meant to reply to the user, write your message and run `echo WAIT_FOR_USER` as your only command."
+    )
+    """Added after the format error message when a no-tool-call reply happens while the user is present."""
     show_observations: bool = not _env_flag("MSWEA_QUIET")
     """Print the full tool output. When False, print a head/tail preview instead (MSWEA_QUIET=1)."""
     observation_preview_lines: int = 4
@@ -122,8 +135,10 @@ class InteractiveAgent(DefaultAgent):
     def __init__(self, *args, config_class=InteractiveAgentConfig, **kwargs):
         super().__init__(*args, config_class=config_class, **kwargs)
         self.cost_last_confirmed = 0.0
+        self._compact_requested = False
 
     def _interrupt(self, content: str, *, itype: str = "UserInterruption") -> NoReturn:
+        self.n_consecutive_format_errors = 0  # the user stepped in, earlier format errors no longer add up
         raise UserInterruption({"role": "user", "content": content, "extra": {"interrupt_type": itype}})
 
     def _print_tool_calls(self, message: dict) -> None:
@@ -256,6 +271,15 @@ class InteractiveAgent(DefaultAgent):
         result: list[dict] = []
         try:
             result = super().step()
+        except FormatError as e:
+            if self.config.confirm_exit and not any(m.get("extra", {}).get("has_tool_calls") for m in e.messages):
+                e.messages = (
+                    *e.messages,
+                    self.model.format_message(
+                        role="user", content=self.config.wait_for_user_hint, extra={"interrupt_type": "FormatError"}
+                    ),
+                )
+            raise
         except KeyboardInterrupt:
             interruption_message = self._prompt_and_handle_slash_commands(
                 "\n\n[bold yellow]Interrupted.[/bold yellow] "
@@ -270,6 +294,17 @@ class InteractiveAgent(DefaultAgent):
                 self._print_footer()
         return result
 
+    def _should_compact(self) -> bool:
+        return self._compact_requested or super()._should_compact()
+
+    def compact(self) -> None:
+        self._compact_requested = False
+        console.print("\n[bold yellow]Compacting the conversation...[/bold yellow]")
+        super().compact()
+        console.print(
+            f"[bold yellow]Compacted to about {_fmt_tokens(estimate_tokens(self.messages))} tokens.[/bold yellow]"
+        )
+
     def execute_actions(self, message: dict) -> list[dict]:
         # Override to handle user confirmation and confirm_exit, with try/finally to preserve partial outputs
         actions = message.get("extra", {}).get("actions", [])
@@ -279,6 +314,10 @@ class InteractiveAgent(DefaultAgent):
             self._ask_confirmation_or_interrupt(commands)
             for action in actions:
                 outputs.append(self.env.execute(action))
+                if self.config.confirm_exit and outputs[-1].get("output", "").strip() == "WAIT_FOR_USER":
+                    raise WaitForUser(
+                        {"role": "exit", "content": "", "extra": {"exit_status": "Submitted", "submission": ""}}
+                    )
         except Submitted as e:
             self._check_for_new_task_or_submit(e)
         finally:
@@ -293,17 +332,20 @@ class InteractiveAgent(DefaultAgent):
     def _check_for_new_task_or_submit(self, e: Submitted) -> NoReturn:
         """Check if user wants to add a new task or submit."""
         if self.config.confirm_exit:
+            waiting = isinstance(e, WaitForUser)
             message = (
-                "[bold yellow]Agent wants to finish.[/bold yellow] "
+                "[bold yellow]Your turn:[/bold yellow] [bold green]reply[/bold green], or [bold]Enter[/bold] to quit "
+                if waiting
+                else "[bold yellow]Agent wants to finish.[/bold yellow] "
                 "[bold green]Type new task[/bold green] or [bold]Enter[/bold] to quit "
-                "([bold]/h[/bold] for commands)\n"
-                "[bold yellow]>[/bold yellow] "
-            )
+            ) + "([bold]/h[/bold] for commands)\n[bold yellow]>[/bold yellow] "
             user_input = self._prompt_and_handle_slash_commands(message).strip()
             if user_input == "/u":  # directly continue
                 self._interrupt("Switched to human mode.")
             elif user_input in self._MODE_COMMANDS_MAPPING:  # ask again
                 return self._check_for_new_task_or_submit(e)
+            elif waiting and user_input:
+                self._interrupt(f"The user replied: {user_input}", itype="UserReply")
             elif user_input:
                 self._interrupt(f"The user added a new task: {user_input}", itype="UserNewTask")
         raise e
@@ -548,6 +590,7 @@ class InteractiveAgent(DefaultAgent):
                 f"[bold green]/e[/bold green] to cycle the thinking level (currently [bold green]{self._thinking_level()}[/bold green]: "
                 f"{' -> '.join(self._thinking_levels()) or 'none supported'})\n"
                 f"[bold green]/e <level>[/bold green] to set it directly (e.g. [bold green]/e low[/bold green])\n"
+                f"[bold green]/compact[/bold green] to compact the conversation before the next model call\n"
                 f"[bold green]/model[/bold green] to pick another model from `model_profiles` "
                 f"(currently [bold green]{escape(self._current_model_name())}[/bold green])",
             )
@@ -567,6 +610,14 @@ class InteractiveAgent(DefaultAgent):
             return self._prompt_and_handle_slash_commands(prompt)
         if user_input == "/model" or user_input.startswith("/model "):
             self._handle_model_command(user_input[6:].strip())
+            return self._prompt_and_handle_slash_commands(prompt)
+        if user_input == "/compact":  # runs before the next model call, when no tool call is waiting for its result
+            self._compact_requested = len(self.messages) > 3
+            console.print(
+                "[bold yellow]Compacting before the next model call.[/bold yellow]"
+                if self._compact_requested
+                else "[bold yellow]Nothing to compact yet.[/bold yellow]"
+            )
             return self._prompt_and_handle_slash_commands(prompt)
         if user_input in self._MODE_COMMANDS_MAPPING:
             if self.config.mode == self._MODE_COMMANDS_MAPPING[user_input]:

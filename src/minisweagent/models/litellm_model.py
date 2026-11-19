@@ -144,7 +144,11 @@ class LitellmModel:
             details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
             cached = get("cache_read_input_tokens")
             if not cached and details is not None:
-                value = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+                value = (
+                    details.get("cached_tokens")
+                    if isinstance(details, dict)
+                    else getattr(details, "cached_tokens", None)
+                )
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cached = int(value)
             return {
@@ -179,7 +183,8 @@ class LitellmModel:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
-        # Note: all model.query() implementations must persist the response and cost on FormatError.
+        # Note: on FormatError, all model.query() implementations must persist the response and cost on the
+        # error message and put the model's own message first, so the agent can show it back to the model.
         try:
             actions = self._parse_actions(response)
         except FormatError as e:
@@ -191,6 +196,7 @@ class LitellmModel:
                 # model_dump failed (e.g. unserializable object); fall back to repr
                 # so the spec contract ("response MUST be persisted") holds unconditionally.
                 e.messages[0]["extra"]["response"] = repr(response)
+            e.messages = (response.choices[0].message.model_dump(), *e.messages)
             raise
         message = response.choices[0].message.model_dump()
         message["extra"] = {

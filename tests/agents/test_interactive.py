@@ -7,6 +7,7 @@ import yaml
 
 from minisweagent.agents.interactive import InteractiveAgent
 from minisweagent.environments.local import LocalEnvironment
+from minisweagent.exceptions import FormatError
 from minisweagent.models.test_models import (
     DeterministicModel,
     DeterministicResponseAPIToolcallModel,
@@ -1393,3 +1394,82 @@ def test_footer_cost_is_not_stale_after_a_failed_call():
         {"role": "user", "extra": {"cost": 0.002}},  # failed call, charged later by run()
     ]
     assert "$0.003000" in "  │  ".join(agent._footer_segments())
+
+
+class _ProseModel(DeterministicToolcallModel):
+    """An output {"prose": text} is a reply without a tool call: it raises FormatError with the model's own
+    message first, as the real models do."""
+
+    def query(self, messages, **kwargs):
+        if "prose" not in (output := self.config.outputs[self.current_index + 1]):
+            return super().query(messages, **kwargs)
+        self.current_index += 1
+        raise FormatError(
+            {"role": "assistant", "content": output["prose"]},
+            {"role": "user", "content": "No tool calls found.", "extra": {"interrupt_type": "FormatError"}},
+        )
+
+
+def test_wait_for_user_hands_the_turn_to_the_user(toolcall_config):
+    """`echo WAIT_FOR_USER` pauses without confirmation (whitelisted), the reply comes back as a reply rather than a
+    new task, the wait itself is recorded as a real command result, and the prompt offers it."""
+    with mock_prompts(["src/parse.py", "", ""]):  # reply, confirm the submit command, Enter at finish
+        agent = InteractiveAgent(
+            model=make_tc_model(
+                [
+                    ("Which file should I look at?", [{"command": "echo WAIT_FOR_USER"}]),
+                    ("Done.", [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}]),
+                ]
+            ),
+            env=LocalEnvironment(),
+            **toolcall_config,
+        )
+        assert agent.run("Fix the parser")["exit_status"] == "Submitted"
+    assert "WAIT_FOR_USER" in get_text(agent.messages[0])
+    wait_result = next(m for m in agent.messages if m.get("role") == "tool")
+    assert wait_result["extra"]["returncode"] == 0
+    reply = agent.messages[agent.messages.index(wait_result) + 1]
+    assert (get_text(reply), reply["extra"]["interrupt_type"]) == ("The user replied: src/parse.py", "UserReply")
+
+
+def test_wait_for_user_is_inert_without_a_user(toolcall_config):
+    """With confirm_exit off (unattended), the prompt never mentions it and the command is just a command."""
+    with mock_prompts([]):  # any prompt would fail
+        agent = InteractiveAgent(
+            model=make_tc_model(
+                [
+                    ("Asking anyway.", [{"command": "echo WAIT_FOR_USER"}]),
+                    ("Done.", [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}]),
+                ]
+            ),
+            env=LocalEnvironment(),
+            **{**toolcall_config, "mode": "yolo", "confirm_exit": False},
+        )
+        assert agent.run("Fix the parser")["exit_status"] == "Submitted"
+    assert "WAIT_FOR_USER" not in get_text(agent.messages[0])
+    assert not any(m.get("extra", {}).get("interrupt_type") == "UserReply" for m in agent.messages)
+
+
+def test_prose_is_shown_back_with_hint_and_user_reply_resets_strikes(toolcall_config):
+    """Prose stays in history followed by the nag and the wait hint. A user reply clears the strike count:
+    without that, prose -> wait -> prose would hit max_consecutive_format_errors=2 and end the session."""
+    with mock_prompts(["Go ahead.", ""]):  # reply to the wait, Enter at finish
+        agent = InteractiveAgent(
+            model=_ProseModel(
+                outputs=[
+                    {"prose": "I think the bug is in parse()."},
+                    make_tc_model([("Shall I fix it?", [{"command": "echo WAIT_FOR_USER"}])]).config.outputs[0],
+                    {"prose": "Fixing it now."},
+                    make_tc_model(
+                        [("Done.", [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}])]
+                    ).config.outputs[0],
+                ]
+            ),
+            env=LocalEnvironment(),
+            **{**toolcall_config, "mode": "yolo", "max_consecutive_format_errors": 2},
+        )
+        assert agent.run("Fix the parser")["exit_status"] == "Submitted"
+    texts = [get_text(m) for m in agent.messages]
+    i = texts.index("I think the bug is in parse().")
+    assert texts[i + 1 : i + 3] == ["No tool calls found.", agent.config.wait_for_user_hint]
+    assert "Fixing it now." in texts

@@ -1,10 +1,11 @@
 """Regression tests for issue #784 — FormatError must carry the unparsed
-LLM response in `e.messages[0]["extra"]["response"]` for trajectory inspection.
+LLM response in `e.messages[-1]["extra"]["response"]` for trajectory inspection.
+The error message comes last: the model's own message is put in front of it.
 
 Each test triggers FormatError via an unrecognised tool name on the parser,
 then asserts that the response payload was persisted into the FormatError's
 extra dict before re-raise. On the pre-fix code these tests fail because
-`e.messages[0]["extra"]` only contains `{"interrupt_type": "FormatError"}`
+`e.messages[-1]["extra"]` only contains `{"interrupt_type": "FormatError"}`
 and no `response` key.
 """
 
@@ -97,7 +98,7 @@ def test_litellm_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "response key missing — fix not applied"
     assert extra["response"], "response payload empty — fix not applied"
     # model_dump(mode='json') was used: result must be JSON-serialisable
@@ -128,7 +129,7 @@ def test_litellm_response_model_format_error_persists_response_with_model_dump()
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == serialized
     json.dumps(extra["response"])  # JSON-serialisable
@@ -149,7 +150,7 @@ def test_litellm_response_model_format_error_persists_response_plain_dict_fallba
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == response
 
@@ -172,11 +173,13 @@ def test_openrouter_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == response  # plain dict round-trip
     assert extra["response"] is not response  # must be a copy, not the same object
     assert extra["cost"] == 0.02
+    assert excinfo.value.messages[0] == response["choices"][0]["message"]  # the model's own message goes first
+    assert extra["has_tool_calls"]  # malformed tool calls: the agent must not send that message back
 
 
 # --------------------------------------------------------------------------- #
@@ -197,11 +200,13 @@ def test_openrouter_response_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == response
     assert extra["response"] is not response  # must be a copy, not the same object
     assert extra["cost"] == 0.02
+    assert excinfo.value.messages[0] == response and excinfo.value.messages[0] is not response
+    assert extra["has_tool_calls"]
 
 
 # --------------------------------------------------------------------------- #
@@ -229,7 +234,7 @@ def test_portkey_model_format_error_persists_response(monkeypatch: pytest.Monkey
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"], "response payload empty — fix not applied"
     json.dumps(extra["response"])  # JSON-serialisable
@@ -263,7 +268,7 @@ def test_portkey_response_model_format_error_persists_response_with_model_dump(
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == serialized
     json.dumps(extra["response"])  # JSON-serialisable
@@ -288,7 +293,7 @@ def test_requesty_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra
     assert extra["response"] == response
     assert extra["response"] is not response  # must be a copy, not the same object
@@ -321,7 +326,7 @@ def test_persisted_response_round_trips_through_json() -> None:
             model.query([{"role": "user", "content": "hi"}])
 
     # Simulate trajectory log serialisation: dump the whole exception messages.
-    payload = excinfo.value.messages[0]
+    payload = excinfo.value.messages[-1]
     serialised = json.dumps(payload)
     assert '"response"' in serialised
     reloaded = json.loads(serialised)
@@ -376,7 +381,7 @@ def test_litellm_textbased_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "response key missing from FormatError extra"
     assert extra["response"] == serialized
     json.dumps(extra["response"])  # JSON-serialisable
@@ -405,7 +410,7 @@ def test_openrouter_textbased_model_format_error_persists_response() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "response key missing from FormatError extra"
     # OpenRouter/textbased stores dict(response) — a shallow copy of the plain dict.
     assert extra["response"] == response
@@ -438,7 +443,7 @@ def test_format_error_not_swallowed_when_model_dump_raises() -> None:
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     # repr fallback must set the key (spec: response MUST be persisted)
     assert "response" in extra, "extra['response'] missing — fallback not applied"
     assert isinstance(extra["response"], str), "repr fallback must produce a string"
@@ -464,7 +469,7 @@ def test_litellm_response_model_format_error_not_swallowed_when_model_dump_raise
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "extra['response'] missing — repr fallback not applied"
     assert isinstance(extra["response"], str), "repr fallback must produce a string"
     assert extra["response"], "repr fallback must be non-empty"
@@ -494,7 +499,7 @@ def test_portkey_model_format_error_not_swallowed_when_model_dump_raises(
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "extra['response'] missing — repr fallback not applied"
     assert isinstance(extra["response"], str), "repr fallback must produce a string"
     assert extra["response"], "repr fallback must be non-empty"
@@ -523,7 +528,7 @@ def test_portkey_response_model_format_error_not_swallowed_when_model_dump_raise
         with pytest.raises(FormatError) as excinfo:
             model.query([{"role": "user", "content": "hi"}])
 
-    extra = excinfo.value.messages[0]["extra"]
+    extra = excinfo.value.messages[-1]["extra"]
     assert "response" in extra, "extra['response'] missing — repr fallback not applied"
     assert isinstance(extra["response"], str), "repr fallback must produce a string"
     assert extra["response"], "repr fallback must be non-empty"

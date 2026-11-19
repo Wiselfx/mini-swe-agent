@@ -25,13 +25,13 @@ BASH_TOOL_RESPONSE_API = {
 }
 
 
-def _format_error_message(error_text: str) -> dict:
+def _format_error_message(error_text: str, **extra) -> dict:
     """Create a FormatError message in Responses API format."""
     return {
         "type": "message",
         "role": "user",
         "content": [{"type": "input_text", "text": error_text}],
-        "extra": {"interrupt_type": "FormatError"},
+        "extra": {"interrupt_type": "FormatError", **extra},
     }
 
 
@@ -99,7 +99,7 @@ def parse_toolcall_actions_response(
             error_text = Template(format_error_template, undefined=StrictUndefined).render(
                 error=error_msg.strip(), actions=[], has_tool_calls=True, **template_kwargs
             )
-            raise FormatError(_format_error_message(error_text))
+            raise FormatError(_format_error_message(error_text, has_tool_calls=True))
         actions.append({"command": args["command"], "tool_call_id": tool_call.get("call_id") or tool_call.get("id")})
     return actions
 

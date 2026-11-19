@@ -42,11 +42,11 @@ def test_sonnet_4_cache_control_integration():
             # Check the messages that were actually sent to litellm.completion
             sent_messages = call_kwargs["messages"]
 
-            # Only the last message should have cache control applied
+            # The last message and the one before the last assistant turn (where the previous request ended)
             assert len(sent_messages) == 3
-
-            # First two messages should not have cache control
-            assert sent_messages[0]["content"] == "Hello, how are you?"
+            assert sent_messages[0]["content"] == [
+                {"type": "text", "text": "Hello, how are you?", "cache_control": {"type": "ephemeral"}}
+            ]
             assert sent_messages[1]["content"] == "I'm doing well!"
 
             # Last message should have cache control
@@ -94,16 +94,14 @@ def test_get_model_anthropic_applies_cache_control(model_name):
             # Check that cache control was applied to the messages passed to litellm
             passed_messages = call_args.kwargs["messages"]
 
-            # Only the last message should have cache control
+            # The last message and the one before the last assistant turn (where the previous request ended)
             assert len(passed_messages) == 4, f"Expected 4 messages for {model_name}"
-
-            # First three messages should not have cache control
             assert passed_messages[0]["content"] == "You are a helpful assistant.", (
                 f"System message content should be preserved for {model_name}"
             )
-            assert passed_messages[1]["content"] == "Hello!", (
-                f"First user message content should be preserved for {model_name}"
-            )
+            assert passed_messages[1]["content"] == [
+                {"type": "text", "text": "Hello!", "cache_control": {"type": "ephemeral"}}
+            ], f"Previous request's end should be marked for {model_name}"
             assert passed_messages[2]["content"] == "Hi there!", (
                 f"Assistant message content should be preserved for {model_name}"
             )

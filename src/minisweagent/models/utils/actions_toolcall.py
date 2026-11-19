@@ -69,7 +69,7 @@ def parse_toolcall_actions(
                     "content": Template(format_error_template, undefined=StrictUndefined).render(
                         actions=[], error=error_msg.strip(), has_tool_calls=True, **template_kwargs
                     ),
-                    "extra": {"interrupt_type": "FormatError"},
+                    "extra": {"interrupt_type": "FormatError", "has_tool_calls": True},
                 }
             )
         actions.append({"command": args["command"], "tool_call_id": tool_call.id})

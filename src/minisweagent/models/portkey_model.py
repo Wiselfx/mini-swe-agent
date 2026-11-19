@@ -117,6 +117,7 @@ class PortkeyModel:
                 # model_dump failed (e.g. unserializable object); fall back to repr
                 # so the spec contract ("response MUST be persisted") holds unconditionally.
                 e.messages[0]["extra"]["response"] = repr(response)
+            e.messages = (response.choices[0].message.model_dump(), *e.messages)
             raise
         message = response.choices[0].message.model_dump()
         message["extra"] = {

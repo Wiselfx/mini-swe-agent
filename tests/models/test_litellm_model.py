@@ -78,7 +78,7 @@ class TestLitellmModel:
         )
         with pytest.raises(FormatError) as exc:
             model.query([{"role": "user", "content": "test"}])
-        assert exc.value.messages[0]["content"] == "cut off"
+        assert exc.value.messages[-1]["content"] == "cut off"
 
     def test_format_observation_messages(self):
         model = LitellmModel(model_name="gpt-4", observation_template="{{ output.output }}")

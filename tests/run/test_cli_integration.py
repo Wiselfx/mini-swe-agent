@@ -91,7 +91,7 @@ def test_mini_command_calls_run_interactive():
         assert args[0] == mock_model  # model
         assert args[1] == mock_environment  # env
         # Verify agent.run was called with the task
-        mock_agent.run.assert_called_once_with("Test task")
+        mock_agent.run.assert_called_once_with("Test task", messages=None)
 
 
 def test_mini_calls_prompt_when_no_task_provided():
@@ -135,7 +135,7 @@ def test_mini_calls_prompt_when_no_task_provided():
         # Verify get_agent was called
         mock_get_agent.assert_called_once()
         # Verify agent.run was called with the task from prompt
-        mock_agent.run.assert_called_once_with("User provided task")
+        mock_agent.run.assert_called_once_with("User provided task", messages=None)
 
 
 def test_mini_with_explicit_model():
@@ -181,7 +181,7 @@ def test_mini_with_explicit_model():
         # Verify get_agent was called
         mock_get_agent.assert_called_once()
         # Verify agent.run was called
-        mock_agent.run.assert_called_once_with("Test task with explicit model")
+        mock_agent.run.assert_called_once_with("Test task with explicit model", messages=None)
 
 
 def test_yolo_mode_sets_correct_agent_config():
@@ -223,7 +223,7 @@ def test_yolo_mode_sets_correct_agent_config():
         # The config (third positional arg) should contain the mode
         assert args[2].get("mode") == "yolo"
         # Verify agent.run was called
-        mock_agent.run.assert_called_once_with("Test yolo task")
+        mock_agent.run.assert_called_once_with("Test yolo task", messages=None)
 
 
 def test_confirm_mode_sets_correct_agent_config():
@@ -265,7 +265,7 @@ def test_confirm_mode_sets_correct_agent_config():
         # The config (third positional arg) should not contain mode when yolo=False
         assert args[2].get("mode") is None
         # Verify agent.run was called
-        mock_agent.run.assert_called_once_with("Test confirm task")
+        mock_agent.run.assert_called_once_with("Test confirm task", messages=None)
 
 
 def test_cost_limit_zero_is_preserved():

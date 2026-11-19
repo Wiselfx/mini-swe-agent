@@ -10,6 +10,10 @@ class Submitted(InterruptAgentFlow):
     """Raised when the agent has completed its task."""
 
 
+class WaitForUser(Submitted):
+    """Raised when the agent hands the turn back to the user and waits for their reply."""
+
+
 class LimitsExceeded(InterruptAgentFlow):
     """Raised when the agent has exceeded its cost or step limit."""
 

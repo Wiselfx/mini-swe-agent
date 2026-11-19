@@ -1,6 +1,9 @@
 agent:
   system_template: |
     You are a helpful assistant that can interact with a computer.
+    {%- if confirm_exit is defined and confirm_exit %}
+    To reply to the user or ask them something, write your message and run `echo WAIT_FOR_USER` as your only command. Their answer comes back to you.
+    {%- endif %}
   instance_template: |
     Please solve this issue: {{task}}
 
@@ -101,6 +104,9 @@ agent:
   step_limit: 0
   cost_limit: 3.
   mode: confirm
+  compact_at: 0.87
+  whitelist_actions:
+    - '^\s*echo WAIT_FOR_USER\s*$'
 environment:
   env:
     PAGER: cat

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -469,11 +470,12 @@ class _FlakyToolcallModel(DeterministicToolcallModel):
         output = self.config.outputs[self.current_index]
         if output.get("_format_error"):
             raise FormatError(
+                *([output["own"]] if "own" in output else []),  # real models put their own message first
                 {
                     "role": "user",
                     "content": "No tool calls found in the response.",
-                    "extra": {"interrupt_type": "FormatError"},
-                }
+                    "extra": {"interrupt_type": "FormatError", **output.get("nag_extra", {})},
+                },
             )
         return output
 
@@ -542,3 +544,56 @@ def test_format_errors_count_against_cost_limit(toolcall_config, reset_global_st
     assert agent.n_calls == 3
     assert agent.cost == 3.0
     assert agent.cost == GLOBAL_MODEL_STATS.cost
+
+
+def test_resume_from_saved_trajectory(model_factory, tmp_path):
+    """A saved session resumes from disk: the old exit is dropped, the dangling submit call gets a result,
+    the new task is appended once, and the save is atomic (no stray .tmp file)."""
+    factory, config = model_factory
+    path = tmp_path / "session.traj.json"
+    submit = [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho first"}]
+    first = DefaultAgent(model=factory([("done", submit)]), env=LocalEnvironment(), **{**config, "output_path": path})
+    assert first.run("First task")["submission"] == "first\n"
+    saved = json.loads(path.read_text())["messages"]
+    assert saved[-1]["role"] == "exit"
+    assert not path.with_name(path.name + ".tmp").exists()
+
+    submit2 = [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho second"}]
+    second = DefaultAgent(
+        model=factory([("again", submit2)]), env=LocalEnvironment(), **{**config, "output_path": path}
+    )
+    assert second.run("Follow-up task", messages=saved)["submission"] == "second\n"
+    messages = json.loads(path.read_text())["messages"]
+    assert [m.get("role") for m in messages].count("system") == 1
+    assert [m.get("role") for m in messages].count("exit") == 1
+    assert messages[: len(saved) - 1] == saved[:-1]
+    idx = next(i for i, m in enumerate(messages) if get_text(m) == "Follow-up task")
+    assert idx == len(saved) - (factory is make_text_model)  # only tool-call formats need a filler result
+    assert all(
+        is_observation_message(m) and "not executed" in get_observation_text(m) for m in messages[len(saved) - 1 : idx]
+    )
+
+
+@pytest.mark.parametrize(
+    ("own", "nag_extra", "shown_back"),
+    [
+        ({"role": "assistant", "content": "The bug is in parse()."}, {}, True),
+        ({"role": "assistant", "content": None}, {}, False),
+        (
+            {"role": "assistant", "content": "Calling.", "tool_calls": [{"id": "c1", "function": {"name": "x"}}]},
+            {"has_tool_calls": True},
+            False,
+        ),
+    ],
+)
+def test_format_error_shows_the_model_its_own_message(toolcall_config, own, nag_extra, shown_back):
+    """The model sees what it said right before the nag, except for messages the APIs reject (empty turns and
+    tool calls without results). The failed call is charged exactly once either way."""
+    submit = make_tc_model([("done", [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}])]).config.outputs[0]
+    outputs = [{"_format_error": True, "own": own, "nag_extra": {"cost": 0.5, **nag_extra}}, submit]
+    agent = DefaultAgent(model=_FlakyToolcallModel(outputs=outputs), env=LocalEnvironment(), **toolcall_config)
+    assert agent.run("Test prose handling")["exit_status"] == "Submitted"
+    nag = next(i for i, m in enumerate(agent.messages) if m.get("extra", {}).get("interrupt_type") == "FormatError")
+    assert (agent.messages[nag - 1] == own) == shown_back
+    assert agent.messages[nag - 1]["role"] == ("assistant" if shown_back else "user")
+    assert agent.cost == 0.5 + submit["extra"]["cost"]

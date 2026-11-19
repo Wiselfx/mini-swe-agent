@@ -1,10 +1,14 @@
 """Cost accounting: cache-read discounts and per-model price overrides."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+from litellm.types.llms.openai import ResponsesAPIResponse
 
+from minisweagent.exceptions import FormatError
 from minisweagent.models.litellm_model import LitellmModel
+from minisweagent.models.litellm_response_model import LitellmResponseModel
 
 GO_KWARGS = {"litellm_session_id": "test", "drop_params": True}
 
@@ -122,3 +126,51 @@ def test_apply_profile_coerces_unsupported_effort():
     assert model.config.model_kwargs["reasoning_effort"] == "minimal"
     model.apply_profile("glm")
     assert model.config.model_kwargs["reasoning_effort"] == "high"
+
+
+# --- Responses API usage ---
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        [{"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "bash", "arguments": '{"command": "ls"}'}],
+        [{"type": "message", "id": "m1", "role": "assistant", "content": [{"type": "output_text", "text": "Hi"}]}],
+    ],
+)
+def test_responses_api_records_usage_with_cached_tokens(output):
+    """Responses API calls keep their token usage, cached tokens included, both on a normal turn and on a turn
+    without a tool call, and are billed at the cache-read rate."""
+    response = ResponsesAPIResponse(
+        **{
+            "id": "r1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "m",
+            "output": output,
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1100,
+                "input_tokens_details": {"cached_tokens": 900},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+        }
+    )
+    model = LitellmResponseModel(model_name="openai/x", pricing={"input": 1.0, "output": 2.0, "cache_read": 0.1})
+    with patch.object(LitellmResponseModel, "_query", return_value=response):
+        try:
+            extra = model.query([{"role": "user", "content": "hi"}])["extra"]
+        except FormatError as e:
+            extra = e.messages[-1]["extra"]
+    assert extra["usage"] == {
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "cached_tokens": 900,
+        "cache_write_tokens": 0,
+    }
+    assert extra["cost"] == pytest.approx((100 * 1.0 + 900 * 0.1 + 100 * 2.0) / 1e6)

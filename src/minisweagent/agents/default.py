@@ -6,13 +6,16 @@ import json
 import logging
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
+from minisweagent.agents.utils import compaction
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.models.utils.content_string import get_content_string
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -33,6 +36,19 @@ class AgentConfig(BaseModel):
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    compact_at: float = 0.0
+    """Compact the conversation before a model call once it fills this share of the context window (0 = never)."""
+    compact_template: str = (
+        "Pause the task: do not call any tools and do not continue the work. Reply only with a summary, as plain text.\n"
+        "{% if recent %}Summarize in detail the recent part of the conversation so far, from the message that starts "
+        "with <boundary>{{boundary}}</boundary> to the end. Tool outputs from this part will be removed afterwards, so "
+        "keep everything from them that is still needed: exact file paths, function names, commands, errors, results."
+        "{% else %}Summarize the earlier part of the conversation so far, from the start up to (not including) the "
+        "message that starts with <boundary>{{boundary}}</boundary>.{% endif %}\n"
+        "Use the sections Goal, Constraints and preferences, Done, In progress, Key decisions, Next steps and Critical "
+        "context. Keep it under {{max_tokens}} tokens."
+    )
+    """Appended to the conversation to ask for each summary. Variables: recent, boundary, max_tokens."""
 
 
 class DefaultAgent:
@@ -47,6 +63,8 @@ class DefaultAgent:
         self.cost = 0.0
         self.n_calls = 0
         self.n_consecutive_format_errors = 0
+        self.compacted_history: list[list[dict]] = []
+        """The full conversation as it was right before each compaction."""
         self._start_time = time.time()
 
     def get_template_vars(self, **kwargs) -> dict:
@@ -85,21 +103,33 @@ class DefaultAgent:
             )
         )
 
-    def run(self, task: str = "", **kwargs) -> dict:
-        """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
+    def run(self, task: str = "", *, messages: list[dict] | None = None, **kwargs) -> dict:
+        """Run step() until agent is finished. Returns dictionary with exit_status, submission keys.
+        Pass `messages` from a saved trajectory to resume it, `task` then becomes the next user message.
+        """
         self.extra_template_vars |= {"task": task, **kwargs}
-        self.messages = []
-        self.add_messages(
-            self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
-            self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
-        )
+        self.messages = [m for m in messages or [] if m.get("role") != "exit"]
+        if self.messages:
+            if self.messages[-1].get("extra", {}).get("actions"):  # tool calls without results can't be sent
+                self.messages += self.model.format_observation_messages(self.messages[-1], [], self.get_template_vars())
+            self.add_messages(self.model.format_message(role="user", content=task))
+        else:
+            self.add_messages(
+                self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
+                self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
+            )
         while True:
             try:
                 self.step()
                 self.n_consecutive_format_errors = 0  # reset on any clean step
             except FormatError as e:
                 # The call was billed before parsing failed, so query() never got to charge it.
-                self.cost += e.messages[0].get("extra", {}).get("cost", 0.0)
+                self.cost += sum(m.get("extra", {}).get("cost", 0.0) for m in e.messages)
+                if "interrupt_type" not in e.messages[0].get("extra", {}) and (
+                    any(m.get("extra", {}).get("has_tool_calls") for m in e.messages)
+                    or not get_content_string(e.messages[0]).strip()
+                ):  # APIs reject tool calls without results and empty turns, so only the model's prose goes back
+                    e.messages = e.messages[1:]
                 self.n_consecutive_format_errors += 1
                 if 0 < self.config.max_consecutive_format_errors <= self.n_consecutive_format_errors:
                     self.add_messages(
@@ -145,11 +175,101 @@ class DefaultAgent:
                     "extra": {"exit_status": "TimeExceeded", "submission": ""},
                 }
             )
+        if self._should_compact():
+            self.compact()
         self.n_calls += 1
         message = self.model.query(self.messages)
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message
+
+    def _should_compact(self) -> bool:
+        if not self.config.compact_at or len(self.messages) < 4:
+            return False
+        window = getattr(self.model, "get_context_window", lambda: None)()
+        return bool(window) and compaction.context_tokens(self.messages) >= self.config.compact_at * window
+
+    def compact(self) -> None:
+        """Replace the conversation with excerpts without tool outputs and two summaries (the first 70%, and the last
+        30% in detail), both written in parallel. The full conversation stays in the trajectory."""
+        window = getattr(self.model, "get_context_window", lambda: None)() or 0
+        scale = min(1.0, 0.4 * window / 24_000) if window else 1.0  # small windows: land well below the trigger
+        plan = compaction.plan(
+            self.messages, first=int(5_000 * scale), middle=int(5_000 * scale), last=int(10_000 * scale), recent=0.3
+        )
+        boundary = get_content_string(self.messages[plan["recent_start"]])[:150]
+        summary_tokens = int(2_000 * scale)
+        # room to append the request to the cached conversation: the instruction plus both summaries, with slack
+        cached = not window or compaction.context_tokens(self.messages) + 2 * summary_tokens + 500 < window
+
+        def summarize(recent: bool) -> tuple[str, float]:
+            return self._summarize(cached, recent=recent, boundary=boundary, max_tokens=summary_tokens)
+
+        with ThreadPoolExecutor(2) as pool:
+            (early, early_cost), (recent, recent_cost) = pool.map(summarize, (False, True))
+        self.cost += early_cost + recent_cost
+
+        def note(content: str) -> dict:
+            return self.model.format_message(role="user", content=content, extra={"interrupt_type": "Compaction"})
+
+        def excerpt(key: str) -> list[dict]:
+            return [compaction.strip_output(self.messages[i]) for i in plan[key]]
+
+        def gap(key: str) -> list[dict]:
+            removed = f"[{len(plan[key])} earlier messages were removed at compaction, see the summary below]"
+            return [self.messages[i] for i in plan[key] if compaction.is_human(self.messages[i])] + (
+                [note(removed)] if plan[key] else []
+            )
+
+        summary = note(
+            "The conversation was compacted to save context: tool outputs were removed and only excerpts and the "
+            f"user's messages remain.\n\n<summary>\n## Earlier\n{early}\n\n## Recent, in detail\n{recent}\n</summary>"
+        )
+        self.compacted_history.append(self.messages)
+        self.messages = [
+            *self.messages[:2],
+            *excerpt("first"),
+            *gap("gap1"),
+            *excerpt("middle"),
+            *gap("gap2"),
+            summary,
+            *excerpt("last"),
+        ]
+        if (
+            self.config.compact_at
+            and window
+            and compaction.context_tokens(self.messages) >= self.config.compact_at * window
+        ):
+            raise RuntimeError("Compaction could not bring the conversation below the compaction threshold")
+
+    def _summarize(self, cached: bool, **template_vars) -> tuple[str, float]:
+        """Ask for one summary. Returns it with the cost of asking."""
+        instruction = Template(self.config.compact_template, undefined=StrictUndefined).render(
+            **self.get_template_vars(**template_vars)
+        )
+        if cached:  # the cached conversation plus one appended message: cheap
+            messages = [*self.messages, self.model.format_message(role="user", content=instruction)]
+        else:  # too full to append to: a transcript without tool outputs, which always fits
+            transcript = "\n\n".join(
+                f"[{m.get('role') or m.get('type')}]: {get_content_string(compaction.strip_output(m))}"
+                for m in self.messages[1:]
+            )
+            messages = [
+                self.messages[0],
+                self.model.format_message(
+                    role="user", content=f"<conversation>\n{transcript}\n</conversation>\n\n{instruction}"
+                ),
+            ]
+        cost = 0.0
+        for _ in range(2):  # a model that calls a tool instead gets one more try
+            try:
+                cost += self.model.query(messages).get("extra", {}).get("cost", 0.0)
+            except FormatError as e:  # a reply without a tool call: the summary we asked for
+                cost += sum(m.get("extra", {}).get("cost", 0.0) for m in e.messages)
+                if "interrupt_type" not in e.messages[0].get("extra", {}):
+                    if text := get_content_string(e.messages[0]).strip():
+                        return text, cost
+        raise RuntimeError("Compaction failed: the model did not reply with a summary")
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
@@ -175,6 +295,7 @@ class DefaultAgent:
                 "submission": last_extra.get("submission", ""),
             },
             "messages": self.messages,
+            **({"compacted_history": self.compacted_history} if self.compacted_history else {}),
             "trajectory_format": "mini-swe-agent-1.1",
         }
         return recursive_merge(agent_data, self.model.serialize(), self.env.serialize(), *extra_dicts)
@@ -186,5 +307,7 @@ class DefaultAgent:
         data = self.serialize(*extra_dicts)
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2))
+            tmp = path.with_name(path.name + ".tmp")  # write-then-rename, a crash mid-save must not eat the session
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(path)
         return data

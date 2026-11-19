@@ -111,6 +111,8 @@ class PortkeyResponseAPIModel:
                 )
             except Exception:
                 e.messages[0]["extra"]["response"] = repr(response)
+            if isinstance(e.messages[0]["extra"]["response"], dict):  # a repr() fallback cannot be sent back
+                e.messages = ({**e.messages[0]["extra"]["response"]}, *e.messages)
             raise
         message = response.model_dump() if hasattr(response, "model_dump") else dict(response)
         message["extra"] = {

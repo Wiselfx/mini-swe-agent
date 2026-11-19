@@ -25,8 +25,9 @@ def _clear_cache_control(entry: dict) -> None:
 
 
 def _set_cache_control(entry: dict) -> None:
-    # Handle None content (e.g., assistant messages with only tool_use)
-    if entry["content"] is None:
+    # None content (assistant messages with only tool_use) and tool results take the mark on the message itself.
+    # Tool results keep their content as is, so they look the same whether marked or not and the prefix stays stable.
+    if entry["content"] is None or entry["role"] == "tool":
         entry["cache_control"] = {"type": "ephemeral"}
         return
 
@@ -40,10 +41,6 @@ def _set_cache_control(entry: dict) -> None:
         ]
     else:
         entry["content"][0]["cache_control"] = {"type": "ephemeral"}
-    if entry["role"] == "tool":
-        # Workaround for weird bug
-        entry["content"][0].pop("cache_control", None)
-        entry["cache_control"] = {"type": "ephemeral"}
 
 
 def set_cache_control(
@@ -58,10 +55,11 @@ def set_cache_control(
         warnings.warn("last_n_messages_offset is deprecated and will be removed in the future. It has no effect.")
 
     messages = copy.deepcopy(messages)
-    new_messages = []
-    for i_entry, entry in enumerate(reversed(messages)):
+    # Mark the end, and where the previous request ended (right before the last assistant turn): Anthropic only looks
+    # back about 20 blocks for an earlier cache entry, which a turn with many tool calls can exceed.
+    previous_end = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=0) - 1
+    for i, entry in enumerate(messages):
         _clear_cache_control(entry)
-        if i_entry == 0:
+        if i in (previous_end, len(messages) - 1):
             _set_cache_control(entry)
-        new_messages.append(entry)
-    return list(reversed(new_messages))
+    return messages
